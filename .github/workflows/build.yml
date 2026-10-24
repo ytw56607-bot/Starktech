@@ -1,0 +1,240 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project
+        run: |
+          mkdir -p app/src/main/java/com/joy/pad app/src/main/res/xml app/src/main/res/values
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "JoyPad"
+          include ':app'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.0' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.joy.pad'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.joy.pad'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="JoyPad" android:theme="@android:style/Theme.Material.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".JoyService"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService"/>
+                      </intent-filter>
+                      <meta-data android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config"/>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="desc">JoyPad: transparent pad jo game joystick ko fast move karta hai</string>
+          </resources>
+          EOF
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF'
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:canPerformGestures="true"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:description="@string/desc"/>
+          EOF
+          cat > app/src/main/java/com/joy/pad/MainActivity.kt <<'EOF'
+          package com.joy.pad
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val p = getSharedPreferences("joy", MODE_PRIVATE)
+                  val l = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(40, 40, 40, 40)
+                  }
+                  val keys = listOf(
+                      "cx" to 250, "cy" to 800, "radius" to 150, "gain" to 300,
+                      "padW" to 600, "padH" to 600, "padX" to 0, "padY" to 0
+                  )
+                  val fields = keys.map { (k, d) ->
+                      l.addView(TextView(this).apply { text = k })
+                      val e = EditText(this).apply {
+                          inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED
+                          setText(p.getInt(k, d).toString())
+                      }
+                      l.addView(e)
+                      k to e
+                  }
+                  l.addView(Button(this).apply {
+                      text = "Save"
+                      setOnClickListener {
+                          val ed = p.edit()
+                          fields.forEach { (k, e) -> ed.putInt(k, e.text.toString().toIntOrNull() ?: 0) }
+                          ed.apply()
+                          Toast.makeText(this@MainActivity, "Saved", Toast.LENGTH_SHORT).show()
+                      }
+                  })
+                  l.addView(Button(this).apply {
+                      text = "Accessibility ON karo"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+                  setContentView(ScrollView(this).apply { addView(l) })
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/joy/pad/JoyService.kt <<'EOF'
+          package com.joy.pad
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.SharedPreferences
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import kotlin.math.hypot
+
+          class JoyService : AccessibilityService() {
+              private lateinit var prefs: SharedPreferences
+              private lateinit var wm: WindowManager
+              private lateinit var pad: View
+              private lateinit var lp: WindowManager.LayoutParams
+              private var stroke: GestureDescription.StrokeDescription? = null
+              private var lastX = 0f
+              private var lastY = 0f
+              private var sx = 0f
+              private var sy = 0f
+              private var lastSend = 0L
+              private val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> applyLayout() }
+
+              private fun g(k: String, d: Int) = prefs.getInt(k, d)
+
+              private fun applyLayout() {
+                  lp.width = g("padW", 600)
+                  lp.height = g("padH", 600)
+                  lp.x = g("padX", 0)
+                  lp.y = g("padY", 0)
+                  try { wm.updateViewLayout(pad, lp) } catch (_: Exception) {}
+              }
+
+              override fun onServiceConnected() {
+                  prefs = getSharedPreferences("joy", MODE_PRIVATE)
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  pad = View(this).apply { setBackgroundColor(0x22FFFFFF) }
+                  lp = WindowManager.LayoutParams(
+                      600, 600,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.START }
+                  pad.setOnTouchListener { _, e ->
+                      val cx = g("cx", 250).toFloat()
+                      val cy = g("cy", 800).toFloat()
+                      val radius = g("radius", 150).toFloat()
+                      val gain = g("gain", 300).toFloat()
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              sx = e.rawX; sy = e.rawY
+                              lastX = cx; lastY = cy
+                              stroke = null
+                              send(cx, cy, true)
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val now = System.currentTimeMillis()
+                              if (now - lastSend >= 25) {
+                                  var dx = (e.rawX - sx) * gain
+                                  var dy = (e.rawY - sy) * gain
+                                  val d = hypot(dx, dy)
+                                  if (d > radius) { dx *= radius / d; dy *= radius / d }
+                                  send(cx + dx, cy + dy, true)
+                              }
+                          }
+                          MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> send(lastX, lastY, false)
+                      }
+                      true
+                  }
+                  applyLayout()
+                  wm.addView(pad, lp)
+                  prefs.registerOnSharedPreferenceChangeListener(listener)
+              }
+
+              private fun send(x: Float, y: Float, more: Boolean) {
+                  lastSend = System.currentTimeMillis()
+                  val p = Path().apply { moveTo(lastX, lastY); lineTo(x, y) }
+                  val s = stroke?.continueStroke(p, 0, 25, more)
+                      ?: GestureDescription.StrokeDescription(p, 0, 25, more)
+                  stroke = if (more) s else null
+                  dispatchGesture(GestureDescription.Builder().addStroke(s).build(), null, null)
+                  lastX = x; lastY = y
+              }
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+              override fun onDestroy() {
+                  try { wm.removeView(pad) } catch (_: Exception) {}
+                  super.onDestroy()
+              }
+          }
+          EOF
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JoyPad-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
