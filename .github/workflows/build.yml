@@ -45,8 +45,8 @@ jobs:
                   applicationId 'com.joy.pad'
                   minSdk 26
                   targetSdk 34
-                  versionCode 1
-                  versionName '1.0'
+                  versionCode 2
+                  versionName '1.1'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -106,8 +106,8 @@ jobs:
                       setPadding(40, 40, 40, 40)
                   }
                   val keys = listOf(
-                      "cx" to 250, "cy" to 800, "radius" to 150, "gain" to 300,
-                      "padW" to 600, "padH" to 600, "padX" to 0, "padY" to 0
+                      "cx" to 477, "cy" to 935, "radius" to 80, "gain" to 100,
+                      "padW" to 300, "padH" to 300, "padX" to 550, "padY" to 700
                   )
                   val fields = keys.map { (k, d) ->
                       l.addView(TextView(this).apply { text = k })
@@ -139,6 +139,7 @@ jobs:
           package com.joy.pad
 
           import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.AccessibilityService.GestureResultCallback
           import android.accessibilityservice.GestureDescription
           import android.content.SharedPreferences
           import android.graphics.Path
@@ -160,16 +161,20 @@ jobs:
               private var lastY = 0f
               private var sx = 0f
               private var sy = 0f
-              private var lastSend = 0L
+              private var busy = false
+              private var active = false
+              private var pendingEnd = false
+              private var tx = 0f
+              private var ty = 0f
               private val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> applyLayout() }
 
               private fun g(k: String, d: Int) = prefs.getInt(k, d)
 
               private fun applyLayout() {
-                  lp.width = g("padW", 600)
-                  lp.height = g("padH", 600)
-                  lp.x = g("padX", 0)
-                  lp.y = g("padY", 0)
+                  lp.width = g("padW", 300)
+                  lp.height = g("padH", 300)
+                  lp.x = g("padX", 550)
+                  lp.y = g("padY", 700)
                   try { wm.updateViewLayout(pad, lp) } catch (_: Exception) {}
               }
 
@@ -178,50 +183,62 @@ jobs:
                   wm = getSystemService(WINDOW_SERVICE) as WindowManager
                   pad = View(this).apply { setBackgroundColor(0x22FFFFFF) }
                   lp = WindowManager.LayoutParams(
-                      600, 600,
+                      300, 300,
                       WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                       WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
                       PixelFormat.TRANSLUCENT
                   ).apply { gravity = Gravity.TOP or Gravity.START }
                   pad.setOnTouchListener { _, e ->
-                      val cx = g("cx", 250).toFloat()
-                      val cy = g("cy", 800).toFloat()
-                      val radius = g("radius", 150).toFloat()
-                      val gain = g("gain", 300).toFloat()
+                      val cx = g("cx", 477).toFloat()
+                      val cy = g("cy", 935).toFloat()
+                      val radius = g("radius", 80).toFloat()
+                      val gain = g("gain", 100).toFloat()
                       when (e.action) {
                           MotionEvent.ACTION_DOWN -> {
                               sx = e.rawX; sy = e.rawY
-                              lastX = cx; lastY = cy
-                              stroke = null
-                              send(cx, cy, true)
+                              lastX = cx; lastY = cy; tx = cx; ty = cy
+                              stroke = null; active = true; pendingEnd = false
+                              if (!busy) next(true)
                           }
                           MotionEvent.ACTION_MOVE -> {
-                              val now = System.currentTimeMillis()
-                              if (now - lastSend >= 25) {
-                                  var dx = (e.rawX - sx) * gain
-                                  var dy = (e.rawY - sy) * gain
-                                  val d = hypot(dx, dy)
-                                  if (d > radius) { dx *= radius / d; dy *= radius / d }
-                                  send(cx + dx, cy + dy, true)
-                              }
+                              var dx = (e.rawX - sx) * gain
+                              var dy = (e.rawY - sy) * gain
+                              val d = hypot(dx, dy)
+                              if (d > radius) { dx *= radius / d; dy *= radius / d }
+                              tx = cx + dx; ty = cy + dy
                           }
-                          MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> send(lastX, lastY, false)
+                          MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                              active = false
+                              if (busy) pendingEnd = true else next(false)
+                          }
                       }
                       true
                   }
-                  applyLayout()
                   wm.addView(pad, lp)
+                  applyLayout()
                   prefs.registerOnSharedPreferenceChangeListener(listener)
               }
 
-              private fun send(x: Float, y: Float, more: Boolean) {
-                  lastSend = System.currentTimeMillis()
-                  val p = Path().apply { moveTo(lastX, lastY); lineTo(x, y) }
-                  val s = stroke?.continueStroke(p, 0, 25, more)
-                      ?: GestureDescription.StrokeDescription(p, 0, 25, more)
+              private fun next(more: Boolean) {
+                  busy = true
+                  val p = Path().apply { moveTo(lastX, lastY); lineTo(tx, ty) }
+                  val s = stroke?.continueStroke(p, 0, 40, more)
+                      ?: GestureDescription.StrokeDescription(p, 0, 40, more)
                   stroke = if (more) s else null
-                  dispatchGesture(GestureDescription.Builder().addStroke(s).build(), null, null)
-                  lastX = x; lastY = y
+                  lastX = tx; lastY = ty
+                  val ok = dispatchGesture(GestureDescription.Builder().addStroke(s).build(),
+                      object : GestureResultCallback() {
+                          override fun onCompleted(g: GestureDescription?) {
+                              busy = false
+                              if (active) next(true)
+                              else if (pendingEnd) { pendingEnd = false; next(false) }
+                          }
+                          override fun onCancelled(g: GestureDescription?) {
+                              busy = false; stroke = null
+                              if (active) next(true)
+                          }
+                      }, null)
+                  if (!ok) busy = false
               }
 
               override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
